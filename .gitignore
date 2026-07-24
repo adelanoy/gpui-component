@@ -3,6 +3,7 @@ target/
 /docks.json
 /profile.json
 .vscode
+.idea
 index.scip
 *.log
 node_modules/
