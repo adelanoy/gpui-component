@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use gpui::{
-    App, AppContext, Context, Entity, InteractiveElement, KeyBinding, ParentElement, Render,
-    Styled, Window, actions, prelude::FluentBuilder as _, px,
-};
+use gpui::{actions, prelude::FluentBuilder as _, px, App, AppContext, Context, Entity, InteractiveElement, KeyBinding, ParentElement, Render, SharedString, Styled, Window};
 
 use gpui_component::{
     ActiveTheme as _, IconName,
@@ -32,8 +29,8 @@ pub(crate) fn init(cx: &mut App) {
 }
 
 pub struct TreeStory {
-    tree_state: Entity<TreeState>,
-    items: Vec<TreeItem>,
+    tree_state: Entity<TreeState<SharedString>>,
+    items: Vec<TreeItem<SharedString>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -77,7 +74,7 @@ fn example_file_items() -> Vec<TreeItem> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn build_file_items(ignorer: &Ignorer, root: &Path, path: &Path) -> Vec<TreeItem> {
+fn build_file_items(ignorer: &Ignorer, root: &Path, path: &Path) -> Vec<TreeItem<SharedString>> {
     let mut items = Vec::new();
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -93,7 +90,7 @@ fn build_file_items(ignorer: &Ignorer, root: &Path, path: &Path) -> Vec<TreeItem
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-            let id = path.to_string_lossy().to_string();
+            let id = vec![path.to_string_lossy().to_string().into()];
             if path.is_dir() {
                 let children = build_file_items(ignorer, root, &path);
                 items.push(TreeItem::new(id, file_name).children(children));
@@ -116,7 +113,7 @@ fn load_tree_items(_: PathBuf) -> Vec<TreeItem> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn load_tree_items(path: PathBuf) -> Vec<TreeItem> {
+fn load_tree_items(path: PathBuf) -> Vec<TreeItem<SharedString>> {
     let ignorer = Ignorer::new(&path.to_string_lossy());
     build_file_items(&ignorer, &path, &path)
 }
@@ -126,7 +123,7 @@ impl TreeStory {
         cx.new(|cx| Self::new(window, cx))
     }
 
-    fn load_files(state: Entity<TreeState>, path: PathBuf, cx: &mut Context<Self>) {
+    fn load_files(state: Entity<TreeState<SharedString>>, path: PathBuf, cx: &mut Context<Self>) {
         cx.spawn(async move |weak_self, cx| {
             let items = load_tree_items(path);
             _ = state.update(cx, |state, cx| {
@@ -155,21 +152,21 @@ impl TreeStory {
     fn on_action_rename(&mut self, _: &Rename, _: &mut Window, cx: &mut gpui::Context<Self>) {
         if let Some(entry) = self.tree_state.read(cx).selected_entry() {
             let item = entry.item();
-            println!("Renaming item: {} ({})", item.label, item.id);
+            println!("Renaming item: {} ({:?})", item.label, item.id);
         }
     }
 
     fn on_action_open(&mut self, _: &OpenFile, _: &mut Window, cx: &mut gpui::Context<Self>) {
         if let Some(entry) = self.tree_state.read(cx).selected_entry() {
             let item = entry.item();
-            println!("Opening item: {} ({})", item.label, item.id);
+            println!("Opening item: {} ({:?})", item.label, item.id);
         }
     }
 
     fn on_action_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut gpui::Context<Self>) {
         if let Some(entry) = self.tree_state.read(cx).selected_entry() {
             let item = entry.item();
-            println!("Deleting item: {} ({})", item.label, item.id);
+            println!("Deleting item: {} ({:?})", item.label, item.id);
         }
     }
 }
@@ -254,7 +251,7 @@ impl Render for TreeStory {
                                                     let item = item.clone();
                                                     move |_, _, _window, _| {
                                                         println!(
-                                                            "Clicked on item: {} ({})",
+                                                            "Clicked on item: {} ({:?})",
                                                             item.label, item.id
                                                         );
                                                     }
@@ -287,7 +284,7 @@ impl Render for TreeStory {
                                             .map(|ix| format!("Selected Index: {}", ix)),
                                     )
                                     .children(self.tree_state.read(cx).selected_item().map(
-                                        |item| Label::new("Selected:").secondary(item.id.clone()),
+                                        |item| Label::new("Selected:").secondary(item.label.clone()),
                                     )),
                             ),
                     ),

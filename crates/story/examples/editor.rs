@@ -9,6 +9,7 @@ use std::{
 
 use autocorrect::ignorer::Ignorer;
 use gpui::{prelude::FluentBuilder, *};
+use itertools::Itertools;
 use gpui_component::{
     ActiveTheme, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants as _},
@@ -69,7 +70,7 @@ fn init() {
 
 pub struct Example {
     editor: Entity<InputState>,
-    tree_state: Entity<TreeState>,
+    tree_state: Entity<TreeState<SharedString>>,
     go_to_line_state: Entity<InputState>,
     language: Lang,
     line_number: bool,
@@ -656,7 +657,7 @@ impl DocumentColorProvider for ExampleLspStore {
     }
 }
 
-fn build_file_items(ignorer: &Ignorer, root: &PathBuf, path: &PathBuf) -> Vec<TreeItem> {
+fn build_file_items(ignorer: &Ignorer, root: &PathBuf, path: &PathBuf) -> Vec<TreeItem<SharedString>> {
     let mut items = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -673,7 +674,7 @@ fn build_file_items(ignorer: &Ignorer, root: &PathBuf, path: &PathBuf) -> Vec<Tr
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-            let id = path.to_string_lossy().to_string();
+            let id = vec![path.to_string_lossy().into()];
             if path.is_dir() {
                 let children = build_file_items(ignorer, &root, &path);
                 items.push(TreeItem::new(id, file_name).children(children));
@@ -753,7 +754,7 @@ impl Example {
         }
     }
 
-    fn load_files(state: Entity<TreeState>, path: PathBuf, cx: &mut App) {
+    fn load_files(state: Entity<TreeState<SharedString>>, path: PathBuf, cx: &mut App) {
         cx.spawn(async move |cx| {
             let ignorer = Ignorer::new(&path.to_string_lossy());
             let items = build_file_items(&ignorer, &path, &path);
@@ -950,9 +951,10 @@ impl Example {
                                     return;
                                 }
 
+                                let path = item.id.iter().map(|id| id.to_string()).join("/");
                                 Self::open_file(
                                     cx.entity(),
-                                    PathBuf::from(item.id.as_str()),
+                                    PathBuf::from(path),
                                     _window,
                                     cx,
                                 )

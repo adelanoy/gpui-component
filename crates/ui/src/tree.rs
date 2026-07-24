@@ -1,12 +1,3 @@
-use std::{cell::RefCell, ops::Range, rc::Rc};
-
-use gpui::{
-    App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyBinding, ListSizingBehavior, MouseButton, ParentElement, Render, RenderOnce,
-    SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
-    prelude::FluentBuilder as _, uniform_list,
-};
-
 use crate::{
     Selectable as _, StyledExt,
     actions::{Confirm, SelectDown, SelectLeft, SelectRight, SelectUp},
@@ -14,6 +5,15 @@ use crate::{
     menu::{ContextMenuExt as _, PopupMenu},
     scroll::ScrollableElement,
 };
+use gpui::{
+    App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyBinding, ListSizingBehavior, MouseButton, ParentElement, Render, RenderOnce,
+    SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
+    prelude::FluentBuilder as _, uniform_list,
+};
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::{cell::RefCell, ops::Range, rc::Rc};
 
 const CONTEXT: &str = "Tree";
 pub(crate) fn init(cx: &mut App) {
@@ -47,9 +47,10 @@ pub(crate) fn init(cx: &mut App) {
 ///     ListItem::new(ix).pl(px(16.) * entry.depth()).child(item.label.clone())
 /// })
 /// ```
-pub fn tree<R>(state: &Entity<TreeState>, render_item: R) -> Tree
+pub fn tree<R, I>(state: &Entity<TreeState<I>>, render_item: R) -> Tree<I>
 where
-    R: Fn(usize, &TreeEntry, bool, &mut Window, &mut App) -> ListItem + 'static,
+    I: Clone + Eq,
+    R: Fn(usize, &TreeEntry<I>, bool, &mut Window, &mut Context<TreeState<I>>) -> ListItem + 'static,
 {
     Tree::new(state, render_item)
 }
@@ -61,24 +62,33 @@ struct TreeItemState {
 
 /// A tree item with a label, children, and an expanded state.
 #[derive(Clone)]
-pub struct TreeItem {
-    pub id: SharedString,
+pub struct TreeItem<I>
+where
+    I: Clone + Eq,
+{
+    pub id: Vec<I>,
     pub label: SharedString,
-    pub children: Vec<TreeItem>,
+    pub children: Vec<TreeItem<I>>,
     state: Rc<RefCell<TreeItemState>>,
 }
 
 /// A flat representation of a tree item with its depth.
 #[derive(Clone)]
-pub struct TreeEntry {
-    item: TreeItem,
+pub struct TreeEntry<I>
+where
+    I: Clone + Eq,
+{
+    item: TreeItem<I>,
     depth: usize,
 }
 
-impl TreeEntry {
+impl<I> TreeEntry<I>
+where
+    I: Clone + Eq,
+{
     /// Get the source tree item.
     #[inline]
-    pub fn item(&self) -> &TreeItem {
+    pub fn item(&self) -> &TreeItem<I> {
         &self.item
     }
 
@@ -113,14 +123,20 @@ impl TreeEntry {
 
 /// Event emitted by [`TreeState`] when user-visible state changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TreeEvent {
+pub enum TreeEvent<I>
+where
+    I: Clone + Eq,
+{
     /// A tree node was expanded.
-    Expanded(SharedString),
+    Expanded(Vec<I>),
     /// A tree node was collapsed.
-    Collapsed(SharedString),
+    Collapsed(Vec<I>),
 }
 
-impl TreeItem {
+impl<I> TreeItem<I>
+where
+    I: Clone + Eq,
+{
     /// Create a new tree item with the given label.
     ///
     /// - The `id` for you to uniquely identify this item, then later you can use it for selection or other purposes.
@@ -131,9 +147,9 @@ impl TreeItem {
     /// ```ignore
     /// TreeItem::new("src/ui/button.rs", "button.rs")
     /// ```
-    pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+    pub fn new(id: Vec<I>, label: impl Into<SharedString>) -> Self {
         Self {
-            id: id.into(),
+            id,
             label: label.into(),
             children: Vec::new(),
             state: Rc::new(RefCell::new(TreeItemState {
@@ -144,13 +160,13 @@ impl TreeItem {
     }
 
     /// Add a child item to this tree item.
-    pub fn child(mut self, child: TreeItem) -> Self {
+    pub fn child(mut self, child: TreeItem<I>) -> Self {
         self.children.push(child);
         self
     }
 
     /// Add multiple child items to this tree item.
-    pub fn children(mut self, children: impl IntoIterator<Item = TreeItem>) -> Self {
+    pub fn children(mut self, children: impl IntoIterator<Item = TreeItem<I>>) -> Self {
         self.children.extend(children);
         self
     }
@@ -184,16 +200,27 @@ impl TreeItem {
         self.state.borrow().expanded
     }
 
-    fn find_ancestors(&self, target_id: &SharedString) -> Option<Vec<TreeItem>> {
-        if self.id == *target_id {
-            return Some(vec![]);
-        }
+    fn find_ancestors(&self, target_id: &mut VecDeque<I>) -> Option<Vec<TreeItem<I>>> {
+        let Some(child) = self
+            .children
+            .iter()
+            .find(|entry| entry.id.last() == target_id.get(0))
+        else {
+            return None;
+        };
 
-        for child in &self.children {
-            if let Some(mut path) = child.find_ancestors(target_id) {
-                path.push(self.clone());
-                return Some(path);
-            }
+        if target_id.len() == 1 {
+            return if target_id.get(0) == child.id.last() {
+                Some(vec![self.clone()])
+            } else {
+                None
+            };
+        };
+
+        target_id.pop_front();
+        if let Some(mut path) = child.find_ancestors(target_id) {
+            path.push(self.clone());
+            return Some(path);
         }
 
         None
@@ -201,21 +228,35 @@ impl TreeItem {
 }
 
 /// State for managing tree items.
-pub struct TreeState {
+pub struct TreeState<I>
+where
+    I: Clone + Eq,
+{
     focus_handle: FocusHandle,
-    entries: Vec<TreeEntry>,
+    entries: Vec<TreeEntry<I>>,
     scroll_handle: UniformListScrollHandle,
     selected_ix: Option<usize>,
     right_clicked_ix: Option<usize>,
-    render_item: Rc<dyn Fn(usize, &TreeEntry, bool, &mut Window, &mut App) -> ListItem>,
+    render_item: Rc<dyn Fn(usize, &TreeEntry<I>, bool, &mut Window, &mut Context<TreeState<I>>) -> ListItem>,
     context_menu_builder: Option<
-        Rc<dyn Fn(usize, &TreeEntry, PopupMenu, &mut Window, &mut Context<TreeState>) -> PopupMenu>,
+        Rc<
+            dyn Fn(
+                usize,
+                &TreeEntry<I>,
+                PopupMenu,
+                &mut Window,
+                &mut Context<TreeState<I>>,
+            ) -> PopupMenu,
+        >,
     >,
 }
 
-impl EventEmitter<TreeEvent> for TreeState {}
+impl<I> EventEmitter<TreeEvent<I>> for TreeState<I> where I: Clone + Eq + 'static {}
 
-impl TreeState {
+impl<I> TreeState<I>
+where
+    I: Clone + Eq + 'static,
+{
     /// Create a new empty tree state.
     pub fn new(cx: &mut App) -> Self {
         Self {
@@ -230,7 +271,7 @@ impl TreeState {
     }
 
     /// Set the tree items.
-    pub fn items(mut self, items: impl Into<Vec<TreeItem>>) -> Self {
+    pub fn items(mut self, items: impl Into<Vec<TreeItem<I>>>) -> Self {
         let items = items.into();
         self.entries.clear();
         for item in items.into_iter() {
@@ -240,7 +281,7 @@ impl TreeState {
     }
 
     /// Set the tree items.
-    pub fn set_items(&mut self, items: impl Into<Vec<TreeItem>>, cx: &mut Context<Self>) {
+    pub fn set_items(&mut self, items: impl Into<Vec<TreeItem<I>>>, cx: &mut Context<Self>) {
         let items = items.into();
         self.entries.clear();
         for item in items.into_iter() {
@@ -263,7 +304,7 @@ impl TreeState {
     }
 
     /// Set the selected index by tree item, or `None` to clear selection.
-    pub fn set_selected_item(&mut self, item: Option<&TreeItem>, cx: &mut Context<Self>) {
+    pub fn set_selected_item(&mut self, item: Option<&TreeItem<I>>, cx: &mut Context<Self>) {
         if let Some(item) = item {
             let ix = self
                 .entries
@@ -272,7 +313,7 @@ impl TreeState {
             if ix.is_some() {
                 self.selected_ix = ix;
             } else {
-                self.expand_ancestors(item.id.clone(), cx);
+                self.expand_ancestors(item.id.clone().into(), cx);
                 self.selected_ix = self
                     .entries
                     .iter()
@@ -285,7 +326,7 @@ impl TreeState {
     }
 
     /// Get the currently selected tree item, if any.
-    pub fn selected_item(&self) -> Option<&TreeItem> {
+    pub fn selected_item(&self) -> Option<&TreeItem<I>> {
         self.selected_ix
             .and_then(|ix| self.entries.get(ix).map(|entry| &entry.item))
     }
@@ -295,37 +336,49 @@ impl TreeState {
     }
 
     /// Find the flat index of the entry whose `item.id` matches, if present.
-    pub(crate) fn index_of(&self, id: &SharedString) -> Option<usize> {
-        self.entries.iter().position(|e| &e.item.id == id)
+    pub(crate) fn index_of(&self, id: &I) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.item.id.last() == Some(id))
     }
 
     /// Expand all ancestors of the node with `id` and scroll it into view.
     /// No-op if `id` is not found. Does not change the selected index.
     pub fn reveal_item(
         &mut self,
-        id: &SharedString,
+        id: &VecDeque<I>,
         strategy: gpui::ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
         self.expand_ancestors(id.clone(), cx);
+        let Some(id) = id.get(0) else {
+            return;
+        };
         if let Some(ix) = self.index_of(id) {
             self.scroll_to_item(ix, strategy);
         }
     }
 
     /// Get the currently selected entry, if any.
-    pub fn selected_entry(&self) -> Option<&TreeEntry> {
+    pub fn selected_entry(&self) -> Option<&TreeEntry<I>> {
         self.selected_ix.and_then(|ix| self.entries.get(ix))
     }
 
-    fn expand_ancestors(&mut self, target_id: SharedString, cx: &mut Context<Self>) {
+    fn expand_ancestors(&mut self, mut target_id: VecDeque<I>, cx: &mut Context<Self>) {
         let mut ancestors = Vec::new();
 
-        for entry in &self.entries {
-            if let Some(found_ancestors) = entry.item.find_ancestors(&target_id) {
-                ancestors = found_ancestors;
-                break;
-            }
+        // find the root entry whose path must be only one segment, and the first segment of the target path
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.item.id.last() == target_id.get(0))
+        else {
+            return;
+        };
+
+        target_id.pop_front();
+        if let Some(found_ancestors) = entry.item.find_ancestors(&mut target_id) {
+            ancestors = found_ancestors;
         }
 
         if ancestors.is_empty() {
@@ -342,7 +395,7 @@ impl TreeState {
         self.rebuild_entries();
     }
 
-    fn add_entry(&mut self, item: TreeItem, depth: usize) {
+    fn add_entry(&mut self, item: TreeItem<I>, depth: usize) {
         self.entries.push(TreeEntry {
             item: item.clone(),
             depth,
@@ -377,7 +430,7 @@ impl TreeState {
     }
 
     fn rebuild_entries(&mut self) {
-        let root_items: Vec<TreeItem> = self
+        let root_items: Vec<TreeItem<I>> = self
             .entries
             .iter()
             .filter(|e| e.is_root())
@@ -462,7 +515,10 @@ impl TreeState {
     }
 }
 
-impl Render for TreeState {
+impl<I> Render for TreeState<I>
+where
+    I: Clone + Eq + 'static,
+{
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_item = self.render_item.clone();
         let state = cx.entity().clone();
@@ -551,20 +607,34 @@ impl Render for TreeState {
 
 /// A tree view element that displays hierarchical data.
 #[derive(IntoElement)]
-pub struct Tree {
+pub struct Tree<I>
+where
+    I: Clone + Eq + 'static,
+{
     id: ElementId,
-    state: Entity<TreeState>,
+    state: Entity<TreeState<I>>,
     style: StyleRefinement,
-    render_item: Rc<dyn Fn(usize, &TreeEntry, bool, &mut Window, &mut App) -> ListItem>,
+    render_item: Rc<dyn Fn(usize, &TreeEntry<I>, bool, &mut Window, &mut Context<TreeState<I>>) -> ListItem>,
     context_menu_builder: Option<
-        Rc<dyn Fn(usize, &TreeEntry, PopupMenu, &mut Window, &mut Context<TreeState>) -> PopupMenu>,
+        Rc<
+            dyn Fn(
+                usize,
+                &TreeEntry<I>,
+                PopupMenu,
+                &mut Window,
+                &mut Context<TreeState<I>>,
+            ) -> PopupMenu,
+        >,
     >,
 }
 
-impl Tree {
-    pub fn new<R>(state: &Entity<TreeState>, render_item: R) -> Self
+impl<I> Tree<I>
+where
+    I: Clone + Eq,
+{
+    pub fn new<R>(state: &Entity<TreeState<I>>, render_item: R) -> Self
     where
-        R: Fn(usize, &TreeEntry, bool, &mut Window, &mut App) -> ListItem + 'static,
+        R: Fn(usize, &TreeEntry<I>, bool, &mut Window, &mut Context<TreeState<I>>) -> ListItem + 'static,
     {
         Self {
             id: ElementId::Name(format!("tree-{}", state.entity_id()).into()),
@@ -585,7 +655,13 @@ impl Tree {
     /// - `menu`: the popup menu builder
     pub fn context_menu<F>(mut self, f: F) -> Self
     where
-        F: Fn(usize, &TreeEntry, PopupMenu, &mut Window, &mut Context<TreeState>) -> PopupMenu
+        F: Fn(
+                usize,
+                &TreeEntry<I>,
+                PopupMenu,
+                &mut Window,
+                &mut Context<TreeState<I>>,
+            ) -> PopupMenu
             + 'static,
     {
         self.context_menu_builder = Some(Rc::new(f));
@@ -593,13 +669,19 @@ impl Tree {
     }
 }
 
-impl Styled for Tree {
+impl<I> Styled for Tree<I>
+where
+    I: Clone + Eq,
+{
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
-impl RenderOnce for Tree {
+impl<I> RenderOnce for Tree<I>
+where
+    I: Clone + Eq + 'static,
+{
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus_handle = self.state.read(cx).focus_handle.clone();
         let scroll_handle = self.state.read(cx).scroll_handle.clone();
@@ -633,19 +715,25 @@ mod tests {
     use indoc::indoc;
 
     use super::{TreeEvent, TreeState};
-    use gpui::{AppContext as _, Render, Subscription};
+    use gpui::{AppContext as _, Render, SharedString, Subscription};
 
-    struct TestCollector {
-        _state: gpui::Entity<TreeState>,
-        events: Rc<RefCell<Vec<TreeEvent>>>,
+    struct TestCollector<I>
+    where
+        I: Clone + Eq,
+    {
+        _state: gpui::Entity<TreeState<I>>,
+        events: Rc<RefCell<Vec<TreeEvent<I>>>>,
         _subscription: Subscription,
     }
 
-    impl TestCollector {
-        fn new(state: &gpui::Entity<TreeState>, cx: &mut gpui::Context<Self>) -> Self {
+    impl<I> TestCollector<I>
+    where
+        I: Clone + Eq + 'static,
+    {
+        fn new(state: &gpui::Entity<TreeState<I>>, cx: &mut gpui::Context<Self>) -> Self {
             let events = Rc::new(RefCell::new(Vec::new()));
             let events_clone = events.clone();
-            let _subscription = cx.subscribe(state, move |_, _, ev: &TreeEvent, _| {
+            let _subscription = cx.subscribe(state, move |_, _, ev: &TreeEvent<I>, _| {
                 events_clone.borrow_mut().push(ev.clone());
             });
             Self {
@@ -656,7 +744,10 @@ mod tests {
         }
     }
 
-    impl Render for TestCollector {
+    impl<I> Render for TestCollector<I>
+    where
+        I: Clone + Eq + 'static,
+    {
         fn render(
             &mut self,
             _: &mut gpui::Window,
@@ -666,7 +757,10 @@ mod tests {
         }
     }
 
-    fn assert_entries(entries: &Vec<super::TreeEntry>, expected: &str) {
+    fn assert_entries<I>(entries: &Vec<super::TreeEntry<I>>, expected: &str)
+    where
+        I: Clone + Eq + 'static,
+    {
         let actual: Vec<String> = entries
             .iter()
             .map(|e| {
@@ -685,19 +779,28 @@ mod tests {
         use super::TreeItem;
 
         let items = vec![
-            TreeItem::new("src", "src")
+            TreeItem::<SharedString>::new(vec!["src".into()], "src")
                 .expanded(true)
                 .child(
-                    TreeItem::new("src/ui", "ui")
+                    TreeItem::new(vec!["src".into(), "ui".into()], "ui")
                         .expanded(true)
-                        .child(TreeItem::new("src/ui/button.rs", "button.rs"))
-                        .child(TreeItem::new("src/ui/icon.rs", "icon.rs"))
-                        .child(TreeItem::new("src/ui/mod.rs", "mod.rs")),
+                        .child(TreeItem::new(
+                            vec!["src".into(), "ui".into(), "button.rs".into()],
+                            "button.rs",
+                        ))
+                        .child(TreeItem::new(
+                            vec!["src".into(), "ui".into(), "icon.rs".into()],
+                            "icon.rs",
+                        ))
+                        .child(TreeItem::new(
+                            vec!["src".into(), "ui".into(), "mod.rs".into()],
+                            "mod.rs",
+                        )),
                 )
-                .child(TreeItem::new("src/lib.rs", "lib.rs")),
-            TreeItem::new("Cargo.toml", "Cargo.toml"),
-            TreeItem::new("Cargo.lock", "Cargo.lock").disabled(true),
-            TreeItem::new("README.md", "README.md"),
+                .child(TreeItem::new(vec!["src/lib.rs".into()], "lib.rs")),
+            TreeItem::new(vec!["Cargo.toml".into()], "Cargo.toml"),
+            TreeItem::new(vec!["Cargo.lock".into()], "Cargo.lock").disabled(true),
+            TreeItem::new(vec!["README.md".into()], "README.md"),
         ];
 
         let state = cx.new(|cx| TreeState::new(cx).items(items));
@@ -753,8 +856,11 @@ mod tests {
 
     #[gpui::test]
     fn test_emits_expanded_event(cx: &mut gpui::TestAppContext) {
+        let expanded_id = vec!["src".into()];
         let items = vec![
-            super::TreeItem::new("src", "src").child(super::TreeItem::new("src/lib.rs", "lib.rs")),
+            super::TreeItem::<SharedString>::new(expanded_id.clone(), "src").child(
+                super::TreeItem::new(vec!["src".into(), "lib.rs".into()], "lib.rs"),
+            ),
         ];
         let state = cx.new(|cx| TreeState::new(cx).items(items));
         let collector = cx.new(|cx| TestCollector::new(&state, cx));
@@ -764,15 +870,19 @@ mod tests {
         });
 
         let events = collector.read_with(cx, |c, _| c.events.borrow().clone());
-        assert_eq!(events, vec![TreeEvent::Expanded("src".into())]);
+        assert_eq!(events, vec![TreeEvent::Expanded(expanded_id)]);
     }
 
     #[gpui::test]
     fn test_emits_collapsed_event(cx: &mut gpui::TestAppContext) {
+        let collapsed_id = vec!["src".into()];
         let items = vec![
-            super::TreeItem::new("src", "src")
+            super::TreeItem::<SharedString>::new(collapsed_id.clone(), "src")
                 .expanded(true)
-                .child(super::TreeItem::new("src/lib.rs", "lib.rs")),
+                .child(super::TreeItem::new(
+                    vec!["src".into(), "lib.rs".into()],
+                    "lib.rs",
+                )),
         ];
         let state = cx.new(|cx| TreeState::new(cx).items(items));
         let collector = cx.new(|cx| TestCollector::new(&state, cx));
@@ -782,23 +892,29 @@ mod tests {
         });
 
         let events = collector.read_with(cx, |c, _| c.events.borrow().clone());
-        assert_eq!(events, vec![TreeEvent::Collapsed("src".into())]);
+        assert_eq!(events, vec![TreeEvent::Collapsed(collapsed_id)]);
     }
 
     #[gpui::test]
     fn test_set_items_does_not_emit_expansion_events(cx: &mut gpui::TestAppContext) {
         let items = vec![
-            super::TreeItem::new("src", "src")
+            super::TreeItem::<SharedString>::new(vec!["src".into()], "src")
                 .expanded(true)
-                .child(super::TreeItem::new("src/lib.rs", "lib.rs")),
+                .child(super::TreeItem::new(
+                    vec!["src".into(), "lib.rs".into()],
+                    "lib.rs",
+                )),
         ];
         let state = cx.new(|cx| TreeState::new(cx).items(items));
         let collector = cx.new(|cx| TestCollector::new(&state, cx));
 
         let new_items = vec![
-            super::TreeItem::new("docs", "docs")
+            super::TreeItem::new(vec!["docs".into()], "docs")
                 .expanded(true)
-                .child(super::TreeItem::new("docs/readme.md", "readme.md")),
+                .child(super::TreeItem::new(
+                    vec!["docs".into(), "readme.md".into()],
+                    "readme.md",
+                )),
         ];
         state.update(cx, |state, cx| {
             state.set_items(new_items, cx);
@@ -813,11 +929,16 @@ mod tests {
 
     #[gpui::test]
     fn test_event_carries_item_id(cx: &mut gpui::TestAppContext) {
+        let expanded_id = vec!["src".into(), "ui".into()];
         let items = vec![
-            super::TreeItem::new("src", "src").expanded(true).child(
-                super::TreeItem::new("src/ui", "ui")
-                    .child(super::TreeItem::new("src/ui/button.rs", "button.rs")),
-            ),
+            super::TreeItem::<SharedString>::new(vec!["src".into()], "src")
+                .expanded(true)
+                .child(super::TreeItem::new(expanded_id.clone(), "ui").child(
+                    super::TreeItem::new(
+                        vec!["src".into(), "ui".into(), "button.rs".into()],
+                        "button.rs",
+                    ),
+                )),
         ];
         let state = cx.new(|cx| TreeState::new(cx).items(items));
         let collector = cx.new(|cx| TestCollector::new(&state, cx));
@@ -828,17 +949,20 @@ mod tests {
         });
 
         let events = collector.read_with(cx, |c, _| c.events.borrow().clone());
-        assert_eq!(events, vec![TreeEvent::Expanded("src/ui".into())]);
+        assert_eq!(events, vec![TreeEvent::Expanded(expanded_id)]);
     }
 
     #[gpui::test]
     fn test_set_selected_item_emits_expanded_events_for_hidden_ancestors(
         cx: &mut gpui::TestAppContext,
     ) {
-        let target = super::TreeItem::new("src/ui/button.rs", "button.rs");
+        let target = super::TreeItem::new(vec![1, 10, 100], "button.rs");
+        let src_id = vec![1];
+        let mut ui_id = src_id.clone();
+        ui_id.push(10);
         let items = vec![
-            super::TreeItem::new("src", "src")
-                .child(super::TreeItem::new("src/ui", "ui").child(target.clone())),
+            super::TreeItem::new(src_id.clone(), "src")
+                .child(super::TreeItem::new(ui_id.clone(), "ui").child(target.clone())),
         ];
         let state = cx.new(|cx| TreeState::new(cx).items(items));
         let collector = cx.new(|cx| TestCollector::new(&state, cx));
@@ -850,10 +974,7 @@ mod tests {
         let events = collector.read_with(cx, |c, _| c.events.borrow().clone());
         assert_eq!(
             events,
-            vec![
-                TreeEvent::Expanded("src".into()),
-                TreeEvent::Expanded("src/ui".into())
-            ]
+            vec![TreeEvent::Expanded(src_id), TreeEvent::Expanded(ui_id)]
         );
     }
 }
